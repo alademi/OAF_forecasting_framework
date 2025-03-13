@@ -14,9 +14,12 @@ EPOCHS = 10
 BATCH_SIZE = 32
 
 MODELS = [
-    "conv", "mlp", "lstm", "cnn-lstm", "trmf", "lstnet-skip",
-    "darnn", "deepglo", "tft", "deepar", "deepstate", "ar",
-    "decision_tree", "random_forest", "xgboost",
+    "conv", "mlp", "lstm", "cnn-lstm",
+    #"trmf",
+    "lstnet-skip",
+    #"darnn"
+    "deepglo", "tft", "deepar", "deepstate", "ar",
+    #"decision_tree", "random_forest", "xgboost",
     "mq-cnn", "deepfactor"
 ]
 

@@ -1,3 +1,4 @@
+import copy
 import csv
 import math
 import random
@@ -5,14 +6,12 @@ import os
 import time
 
 import pandas as pd
-import joblib
 import numpy as np
 import torch
 from sklearn.cluster import KMeans
 from sklearn.metrics import euclidean_distances, pairwise_distances
 from sklearn.preprocessing import StandardScaler
-from torch import optim, nn
-from torch.utils.data import TensorDataset, DataLoader
+
 
 import models_util
 import util
@@ -29,7 +28,6 @@ SEED = 42
 
 MODELS = ModelBuilder.get_available_models()
 scaler = StandardScaler()
-
 
 os.environ['PYTHONHASHSEED'] = str(SEED)
 random.seed(SEED)
@@ -98,11 +96,12 @@ def finetune_models(base_model, model_name, dataset, val, clustering_results):
 
     val_windows, val_labels = util.make_windows(val, WINDOW_SIZE, HORIZON)
 
-    clustered_windows, clustered_labels = util.create_clustered_data(val_windows, val_labels, clusters_no, clusters_labels)
+    clustered_windows, clustered_labels = util.create_clustered_data(val_windows, val_labels, clusters_no,
+                                                                     clusters_labels)
 
     finetuned_models = []
     for i in range(clusters_no):
-        save_dir = f"/Users/aalademi/PycharmProjects/ecml/Models/{dataset}/offline/{model_name}/cluster{i+1}"
+        save_dir = f"/Init_Models/{dataset}/offline/{model_name}/cluster{i + 1}"
         cluster_windows = clustered_windows[i]
         cluster_labels = clustered_labels[i]
         cluster_model = models_util.train_specialized_models(base_model, cluster_windows, cluster_labels, save_dir)
@@ -112,7 +111,7 @@ def finetune_models(base_model, model_name, dataset, val, clustering_results):
 
 
 def get_base_model(model_name, dataset_name):
-    path = f"/Users/aalademi/PycharmProjects/ecml/Models/{dataset_name}/base-model/{model_name}"
+    path = f"/Init_Models/{dataset_name}/base-model/{model_name}"
     model = load_model(model_name, path)
     return model
 
@@ -120,11 +119,12 @@ def get_base_model(model_name, dataset_name):
 def get_finetuned_models(model_name, dataset_name, clusters_no):
     finetuned_models = []
     for i in range(clusters_no):
-        path = f"/Users/aalademi/PycharmProjects/ecml/Models/{dataset_name}/offline/{model_name}/cluster{i+1}"
+        path = f"/Init_Models/{dataset_name}/offline/{model_name}/cluster{i + 1}"
         model = load_model(model_name, path)
         finetuned_models.append(model)
 
     return finetuned_models
+
 
 def average_model_weights(models):
     averaged_weights = []
@@ -184,39 +184,92 @@ def fuse_clusters(kmeans_old, kmeans_new, threshold=0.1):
     return merged_kmeans
 
 
-def retrigger_clustering(validation_set, finetuned_models, model_name, file_name):
+def retrigger_clustering(kmeans, validation_set, finetuned_models, model_name, file_name):
+    """
+    Re-performs clustering and updates machine learning models by fine-tuning or initializing new models.
+
+    Args:
+        kmeans: Previous KMeans model.
+        validation_set: New validation data.
+        finetuned_models: List of previously fine-tuned models (one per old cluster).
+        model_name: Name of the base model.
+        file_name: File name identifier for storing models.
+
+    Returns:
+        updated_models: List of updated models in the correct order.
+        new_kmeans: Newly trained KMeans model.
+    """
+
+    # Step 1: Create new validation windows and labels
     new_validation_windows, new_validation_labels = util.make_windows(validation_set, WINDOW_SIZE, HORIZON)
 
+    # Step 2: Perform new clustering
     new_kmeans = cluster_data(validation_set)
-
     clusters_no = new_kmeans.n_clusters
     cluster_labels = new_kmeans.labels_
+    new_centers = new_kmeans.cluster_centers_
 
-    clustered_windows, clustered_labels = util.create_clustered_data(new_validation_windows, new_validation_labels, clusters_no,
-                                                                     cluster_labels)
-    base_model = get_base_model(model_name, file_name)
-    new_models = []
+    # Step 3: Create clustered datasets
+    clustered_windows, clustered_labels = util.create_clustered_data(
+        new_validation_windows, new_validation_labels, clusters_no, cluster_labels
+    )
+
+    # Step 4: Get previous clusters and models
+    previous_n_clusters = kmeans.n_clusters
+    previous_centers = kmeans.cluster_centers_
+
+    # Step 5: Map new clusters to old clusters based on minimum Euclidean distance
+    cluster_mapping = {}  # Maps new cluster index -> best matching old cluster index
+    matched_old_models = set()  # Track which old models have been reused
+
     for i in range(clusters_no):
-        save_dir = f"/Users/aalademi/PycharmProjects/ecml/Models/{file_name}/online/{model_name}/cluster{len(finetuned_models) + 1}"
+        best_match_idx = None
+        best_similarity = float('inf')  # Lower is better (Euclidean distance)
+
+        for j in range(previous_n_clusters):
+            similarity_score = np.linalg.norm(new_centers[i] - previous_centers[j])  # Euclidean distance
+
+            if similarity_score < best_similarity:
+                best_similarity = similarity_score
+                best_match_idx = j
+
+        cluster_mapping[i] = best_match_idx if best_similarity < 0.5 else None  # Map only if similarity is close
+
+    # Step 6: Train or fine-tune models in correct order
+    updated_models = [None] * clusters_no  # Ensure correct order
+    base_model = get_base_model(model_name, file_name)
+
+    for i in range(clusters_no):
+        save_dir = f"/Init_Models/{file_name}/online/{model_name}/cluster{i}"
+
         cluster_windows = clustered_windows[i]
         cluster_labels = clustered_labels[i]
-        cluster_model = models_util.train_specialized_models(base_model, cluster_windows, cluster_labels, save_dir)
-        new_models.append(cluster_model)
+        matched_old_idx = cluster_mapping[i]
+
+        # Case 1: Highly similar cluster → Fine-tune the corresponding old model
+        if matched_old_idx is not None and matched_old_idx not in matched_old_models:
+            print(f"Cluster {i} matches old cluster {matched_old_idx}, fine-tuning...")
+            pretrained_model = copy.deepcopy(finetuned_models[matched_old_idx])
+            cluster_model = models_util.train_specialized_models(pretrained_model, cluster_windows, cluster_labels,
+                                                                 save_dir)
+            matched_old_models.add(matched_old_idx)
+        else:
+            print(f"Cluster {i} is entirely new, initializing from the base model...")
+            cluster_model = models_util.train_specialized_models(base_model, cluster_windows, cluster_labels, save_dir)
+
+        # Store model in correct cluster order
+        updated_models[i] = cluster_model
+
+    return updated_models, new_kmeans
 
 
-    return new_models, new_kmeans, new_validation_windows
-
-
-def detect_concept_drift(validation_set, update, models, model_name, file_name):
+def detect_periodic_concept_drift(kmeans, validation_set, update, models, model_name, file_name):
     # Check for concept drift
     new_kmeans = None
-    new_validation_windows = None
     if update:
-        new_models, new_kmeans, new_validation_windows = retrigger_clustering(validation_set, models, model_name, file_name,
-                                                                              )
-        models = models + new_models
+        models, new_kmeans = retrigger_clustering(kmeans, validation_set, models, model_name, file_name)
 
-    return models, new_kmeans, new_validation_windows
+    return models, new_kmeans
 
 
 def compute_update_periods(test_size):
@@ -242,19 +295,15 @@ def evaluate_periodic(finetuned_models, model_name, file_name, val, test, kmeans
         drift_points += 1
         if t in update_periods:
             print(f"Triggering model update at time step {t}")
-            finetuned_models, new_kmeans, new_validation_windows = detect_concept_drift(
-                val, True, finetuned_models, model_name, file_name)
-            if new_kmeans is not None:
-                new_cluster_centers = new_kmeans.cluster_centers_
-                cluster_centers = np.concatenate((cluster_centers, new_cluster_centers), axis=0)
-                current_validation_window = new_validation_windows
-                current_kmeans = new_kmeans
-                print(f"Detected concept drift at time {t}")
+            finetuned_models, updated_kmeans = detect_concept_drift(
+                kmeans, val, True, finetuned_models, model_name, file_name)
+            if updated_kmeans is not None:
+                kmeans = updated_kmeans
+                cluster_centers = kmeans.cluster_centers_
+
         print(f"size of vaildation_set after : {len(val)}")
         print(f'size of models : {len(finetuned_models)}')
         print(f'size of clusters centers : {len(cluster_centers)}')
-
-
 
     predictions = np.array(predictions)
     labels = np.array(test_labels).squeeze()
@@ -273,8 +322,6 @@ def evaluate_periodic(finetuned_models, model_name, file_name, val, test, kmeans
     print(f"mse of finetuned models: {mse_orig}")
 
     return rmse_orig
-
-
 
 
 def predict_value(models, model_name, recent_subsequence, cluster_centers):
@@ -370,20 +417,21 @@ def prepare_data(data_path):
             dataset_results = []  # Store results for this dataset
 
             for model_name in MODELS:
-                #models_util.train_model(train, test, model_name, dataset_name)
+                # models_util.train_model(train, test, model_name, dataset_name)
                 base_model = get_base_model(model_name, dataset_name)
 
                 # Evaluate Base Model
-                #result_base = evaluate_model(base_model, model_name, test, dataset_name)
+                # result_base = evaluate_model(base_model, model_name, test, dataset_name)
 
                 # Perform clustering and fine-tune models
                 clustering_results = cluster_data(val)
-               # finetuned_models = finetune_models(base_model, model_name, dataset_name, val, clustering_results)
+                # finetuned_models = finetune_models(base_model, model_name, dataset_name, val, clustering_results)
                 finetuned_models = get_finetuned_models(model_name, dataset_name, clustering_results.n_clusters)
-                #result_offline = evaluate_offline(finetuned_models, model_name, dataset_name, test, clustering_results.cluster_centers_)
-                # Evaluate Fine-tuned Models
+                # result_offline = evaluate_offline(finetuned_models, model_name, dataset_name, test, clustering_results.cluster_centers_)
+                # Evaluate Fine-tuned Init_Models
                 start_time = time.time()
-                result_online = evaluate_periodic(finetuned_models, model_name, dataset_name, val, test, clustering_results)
+                result_online = evaluate_periodic(finetuned_models, model_name, dataset_name, val, test,
+                                                  clustering_results)
                 end_time = time.time()
                 runtime = end_time - start_time
 
@@ -399,8 +447,6 @@ def prepare_data(data_path):
             reset_pytorch_configuration()
 
 
-
-
 if __name__ == '__main__':
-    test_files_path = "test2"
+    test_files_path = "test3"
     prepare_data(test_files_path)

@@ -16,8 +16,8 @@ from torch.utils.data import TensorDataset, DataLoader
 
 import models_util
 import util
-from models_config import ModelBuilder
-from models_util import load_model
+from underopt_models_config import UnderOptModelBuilder
+from models_util import load_model, load_underopt_model
 from util import perform_clustering
 
 HORIZON = 1
@@ -27,7 +27,7 @@ EPOCHS = 50
 LR = 0.001
 SEED = 42
 
-MODELS = ModelBuilder.get_available_models()
+MODELS = UnderOptModelBuilder.get_available_models()
 scaler = StandardScaler()
 
 os.environ['PYTHONHASHSEED'] = str(SEED)
@@ -113,7 +113,7 @@ def finetune_models(base_model, model_name, dataset, val, clustering_results):
 
 def get_base_model(model_name, dataset_name):
     path = f"/Users/aalademi/PycharmProjects/ecml/Models/{dataset_name}/base-model/{model_name}"
-    model = load_model(model_name, path)
+    model = load_underopt_model(model_name, path)
     return model
 
 
@@ -131,6 +131,8 @@ def evaluate_model(base_model, model_name, test, dataset_name, original_data):
     # Inverse-transform to the original scale.
     predictions_orig = scaler.inverse_transform(predictions.reshape(-1, 1)).squeeze()
     labels_orig = scaler.inverse_transform(labels.reshape(-1, 1)).squeeze()
+    print("Predictions Shape:", predictions_orig.shape)
+    print("Labels Shape:", labels_orig.shape)
 
     mse_orig = np.mean((predictions_orig - labels_orig) ** 2)
     rmse_orig = np.sqrt(mse_orig)
@@ -150,7 +152,7 @@ def get_finetuned_models(model_name, dataset_name, clusters_no):
     finetuned_models = []
     for i in range(clusters_no):
         path = f"/Users/aalademi/PycharmProjects/ecml/Models/{dataset_name}/offline/{model_name}/cluster{i + 1}"
-        model = load_model(model_name, path)
+        model = load_underopt_model(model_name, path)
         finetuned_models.append(model)
 
     return finetuned_models
@@ -486,7 +488,7 @@ def train_model(train, test, model_name, file_name, WINDOW_SIZE=7, HORIZON=1):
             test_windows_input = test_windows
 
     if model_name in ["decision_tree", "random_forest", "xgboost"]:
-        model_builder = ModelBuilder(model_type=model_name, n_timesteps=WINDOW_SIZE, horizon=HORIZON)
+        model_builder = UnderOptModelBuilder(model_type=model_name, n_timesteps=WINDOW_SIZE, horizon=HORIZON)
         model = model_builder.build_model()
         model.fit(train_windows_input, train_labels)
         checkpoint_path = os.path.join(model_path, "best_model.pkl")
@@ -500,7 +502,7 @@ def train_model(train, test, model_name, file_name, WINDOW_SIZE=7, HORIZON=1):
             print(f"Prediction shape OK: {predictions.shape}")
         return
 
-    model_builder = ModelBuilder(model_type=model_name, n_timesteps=WINDOW_SIZE, horizon=HORIZON)
+    model_builder = UnderOptModelBuilder(model_type=model_name, n_timesteps=WINDOW_SIZE, horizon=HORIZON)
     model = model_builder.build_model().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
     criterion = nn.L1Loss()

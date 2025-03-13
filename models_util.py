@@ -1,22 +1,23 @@
 import copy
 import os
-
-import joblib
 import numpy as np
 import torch
+import joblib
 from sklearn.base import BaseEstimator
+from sklearn.model_selection import train_test_split
 from torch import optim, nn
 from torch.utils.data import TensorDataset, DataLoader
 
 import util
 from models_config import ModelBuilder
-
+from underopt_models_config import UnderOptModelBuilder
 
 HORIZON = 1
 WINDOW_SIZE = 7
-BATCH_SIZE = 128
-EPOCHS = 50
-LR = 0.001
+BATCH_SIZE = 64
+EPOCHS = 30
+LR = 0.0001
+PATIENCE = 5
 SEED = 42
 
 
@@ -31,7 +32,7 @@ def train_model(train, test, model_name, file_name, WINDOW_SIZE=7, HORIZON=1):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_path = f'Models/{file_name}/base-model/{model_name}'
+    model_path = f'Init_Models/{file_name}/base-model/{model_name}'
     os.makedirs(model_path, exist_ok=True)
 
     if model_name in ["mlp", "decision_tree", "random_forest", "xgboost"]:
@@ -156,9 +157,43 @@ def load_model(model_name, path):
     return model
 
 
+def load_underopt_model(model_name, path):
+    """
+    Loads a trained model from the given path.
 
-import numpy as np
-import torch
+    Args:
+        model_name (str): Name of the model to be loaded.
+        path (str): Path to the directory where the model is stored.
+
+    Returns:
+        model: Loaded model.
+    """
+    model_path = os.path.join(path, "best_model.pkl" if model_name in ["decision_tree", "random_forest",
+                                                                       "xgboost"] else "best_model.pth")
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+
+    # Load scikit-learn models
+    if model_name in ["decision_tree", "random_forest", "xgboost"]:
+        model = joblib.load(model_path)
+        print(f"Loaded {model_name} model from: {model_path}")
+        return model
+
+    # Load PyTorch models
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_builder = UnderOptModelBuilder(model_type=model_name, n_timesteps=WINDOW_SIZE, horizon=HORIZON)
+    model = model_builder.build_model().to(device)
+
+    # Load state dict safely with weights_only=True
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+
+    model.eval()
+    print(f"Loaded {model_name} model from: {model_path}")
+
+    return model
+
+
 
 def evaluate(model, model_name, subsequence):
     """
@@ -231,94 +266,109 @@ def load_finetuned_models(model_class, model_path, device):
     return model
 
 
-
-import os
-import numpy as np
-import torch
-import torch.optim as optim
-import torch.nn as nn
-import joblib
-from sklearn.base import clone as clone_model
-from torch.utils.data import TensorDataset, DataLoader
-from copy import deepcopy
-
-
-
 def train_specialized_models(base_model, cluster_windows, cluster_labels, save_dir):
-    """
-    Fine-tunes a model on cluster-specific data and saves it.
-    """
+    if len(cluster_windows) < 2 or len(cluster_labels) < 2:
+        print(f"Skipping training for cluster in {save_dir} due to insufficient data.")
+        return None
 
-    # Clone the model properly
     if isinstance(base_model, torch.nn.Module):
-        cloned_model = deepcopy(base_model)
-        cloned_model.load_state_dict(base_model.state_dict())  # Load pre-trained weights
+        cloned_model = copy.deepcopy(base_model)
+        cloned_model.load_state_dict(base_model.state_dict())
     else:
         cloned_model = clone_model(base_model)
 
-    # Scikit-learn Model Training
     if isinstance(cloned_model, BaseEstimator):
         if cluster_windows.ndim == 3 and cluster_windows.shape[2] == 1:
             cluster_windows = np.squeeze(cluster_windows, axis=2)
-
-        cloned_model.fit(cluster_windows, cluster_labels)
-
+        X_train, X_val, y_train, y_val = train_test_split(cluster_windows, cluster_labels, test_size=0.2, random_state=SEED)
+        cloned_model.fit(X_train, y_train)
+        val_loss = np.mean((cloned_model.predict(X_val) - y_val) ** 2)
+        print(f"Validation Loss: {val_loss}")
         os.makedirs(save_dir, exist_ok=True)
         model_save_path = os.path.join(save_dir, "best_model.pkl")
         joblib.dump(cloned_model, model_save_path)
-
         return cloned_model
 
-    # PyTorch Model Training
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cloned_model.to(device)
 
-    # Ensure proper input shape
     if cluster_windows.ndim == 2:
         cluster_windows = np.expand_dims(cluster_windows, axis=-1)
 
-    # Convert to PyTorch tensors
     cluster_windows = torch.tensor(cluster_windows, dtype=torch.float32).to(device)
     cluster_labels = torch.tensor(cluster_labels, dtype=torch.float32).to(device)
 
-    # Prepare DataLoader
-    dataset = TensorDataset(cluster_windows, cluster_labels)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    if len(cluster_windows) < 2:
+        print(f"Skipping training for cluster in {save_dir} due to insufficient data after tensor conversion.")
+        return None
 
-    optimizer = optim.Adam(cloned_model.parameters(), lr=LR)
-    criterion = nn.MSELoss()  # Change to nn.CrossEntropyLoss() if it's classification
+    # Ensure at least 2 samples are available
+    train_size = int(0.8 * len(cluster_windows))
+    if train_size < 1 or (len(cluster_windows) - train_size) < 1:
+        print(f"Skipping training for cluster in {save_dir} because train or validation set would be empty.")
+        return None
 
-    # Training Loop
+    train_data, val_data = torch.utils.data.random_split(
+        TensorDataset(cluster_windows, cluster_labels), [train_size, len(cluster_windows) - train_size]
+    )
+
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
+
+    optimizer = optim.Adam(cloned_model.parameters(), lr=LR, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+
     cloned_model.train()
     for epoch in range(EPOCHS):
+        cloned_model.train()
         epoch_loss = 0.0
         for batch_x, batch_y in train_loader:
             optimizer.zero_grad()
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-
             outputs = cloned_model(batch_x)
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
-
             if outputs.shape != batch_y.shape:
                 batch_y = batch_y.view_as(outputs)
-
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
-
             epoch_loss += loss.item()
+        if len(val_loader) == 0:
+            print(f"Skipping validation epoch in {save_dir} because val_loader is empty.")
+            return None
+        val_loss = 0.0
+        cloned_model.eval()
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                outputs = cloned_model(batch_x)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+                val_loss += criterion(outputs, batch_y).item()
+        val_loss /= len(val_loader)
+        print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {epoch_loss / len(train_loader)}, Val Loss: {val_loss}")
 
-        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {epoch_loss / len(train_loader)}")
+        scheduler.step(val_loss)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if patience_counter >= PATIENCE:
+            print("Early stopping triggered.")
+            break
 
-    # Save fine-tuned model
     os.makedirs(save_dir, exist_ok=True)
     model_save_path = os.path.join(save_dir, "best_model.pth")
     torch.save(cloned_model.state_dict(), model_save_path)
-
     print(f"Fine-tuned model saved at: {model_save_path}")
-
     return cloned_model
+
 
 
 
