@@ -22,7 +22,7 @@ from util import perform_clustering
 
 HORIZON = 1
 WINDOW_SIZE = 7
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 EPOCHS = 50
 LR = 0.001
 SEED = 42
@@ -30,34 +30,23 @@ SEED = 42
 MODELS = ModelBuilder.get_available_models()
 scaler = StandardScaler()
 
+# Set up MPS (Metal Performance Shaders) for Mac GPU acceleration
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Ensure reproducibility
 os.environ['PYTHONHASHSEED'] = str(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
+torch.backends.mps.allow_tf32 = True  # Enable TF32 precision for better performance
 
 def reset_pytorch_configuration():
-    """
-    Reset PyTorch configuration by clearing CUDA cache and re-setting random seeds.
-    This helps avoid interference from previous runs when processing multiple datasets.
-    """
-    # Clear CUDA cache if available
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Reinitialize random seeds for reproducibility
+    """Reset PyTorch configuration by clearing MPS cache and re-setting random seeds."""
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()  # Clear MPS cache
     torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(SEED)
-        torch.cuda.manual_seed_all(SEED)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
 
 
 def preprocess_data(data):
@@ -632,5 +621,5 @@ def prepare_data(data_path):
 
 
 if __name__ == '__main__':
-    test_files_path = "test"
+    test_files_path = "test-files"
     prepare_data(test_files_path)
